@@ -4,15 +4,32 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from anthropic import Anthropic
 from fastapi.middleware.cors import CORSMiddleware
-import json 
 
 import os
+
+os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
+
+from google_auth_oauthlib.flow import Flow
+from fastapi.responses import RedirectResponse
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
+from email.mime.text import MIMEText
+
+import base64
+import json 
 
 load_dotenv()
 
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
 supabase = create_client(supabase_url, supabase_key)
+
+google_client_id = os.environ.get("GOOGLE_CLIENT_ID")
+google_client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/userinfo.email",
+]
 
 anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
 client = Anthropic(api_key=anthropic_key)
@@ -32,6 +49,12 @@ class DraftRequest(BaseModel):
 class EmailParseRequest(BaseModel):
     email_text: str
     agent_id: str
+
+class SendEmailRequest(BaseModel):
+    agent_id: str
+    to_email: str
+    subject: str
+    body: str
 
 @app.post("/draft")
 def create_draft(request: DraftRequest):
@@ -135,3 +158,97 @@ def parse_email(request: EmailParseRequest):
         }).execute()
 
     return {"lead": new_lead.data}
+
+@app.get("/auth/google/start")
+def google_auth_start(agent_id: str):
+    flow = Flow.from_client_config(
+        {
+            "web": {
+                "client_id": google_client_id,
+                "client_secret": google_client_secret,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        },
+        scopes=GMAIL_SCOPES,
+    )
+    flow.redirect_uri = "http://localhost:8000/auth/google/callback"
+
+    flow.code_verifier = "kindrasastaticverifierstringthatislongenough1234567890"
+
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+        state=agent_id,
+    )
+
+    return RedirectResponse(auth_url)
+
+@app.get("/auth/google/callback")
+def google_auth_callback(code: str, state: str):
+    flow = Flow.from_client_config(
+        {
+            "web": {
+                "client_id": google_client_id,
+                "client_secret": google_client_secret,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        },
+        scopes=GMAIL_SCOPES,
+    )
+    flow.redirect_uri = "http://localhost:8000/auth/google/callback"
+
+    flow.code_verifier = "kindrasastaticverifierstringthatislongenough1234567890"
+
+    # exchange the code for tokens
+    flow.fetch_token(code=code)
+    credentials = flow.credentials
+
+    userinfo_service = build("oauth2", "v2", credentials=credentials)
+    userinfo = userinfo_service.userinfo().get().execute()
+    email_address = userinfo["email"]
+
+    # the agent_id we tucked into state earlier
+    agent_id = state
+
+    # store the connection
+    supabase.table("email_connections").upsert({
+        "agent_id": agent_id,
+        "provider": "google",
+        "email_address": email_address,
+        "refresh_token": credentials.refresh_token,
+    }, on_conflict="agent_id").execute()
+
+    return {"status": "connected"}
+
+@app.post("/send-email")
+def send_email(request: SendEmailRequest):
+
+    connection = supabase.table("email_connections").select("refresh_token, email_address").eq("agent_id", request.agent_id).single().execute()
+    
+    stored_refresh_token = connection.data["refresh_token"]
+    sender_email_address = connection.data["email_address"]
+
+    creds = Credentials(
+    token=None,
+    refresh_token=stored_refresh_token,
+    token_uri="https://oauth2.googleapis.com/token",
+    client_id=google_client_id,
+    client_secret=google_client_secret,
+    scopes=GMAIL_SCOPES,
+    )
+
+    mime = MIMEText(request.body)
+    mime["to"] = request.to_email
+    mime["from"] = sender_email_address
+    mime["subject"] = request.subject
+    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+   
+    try:
+        service = build("gmail", "v1", credentials=creds)
+        service.users().messages().send(userId="me", body={"raw": raw}).execute()
+        return {"status": "success", "to": request.to_email}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
