@@ -221,7 +221,8 @@ def google_auth_callback(code: str, state: str):
         "refresh_token": credentials.refresh_token,
     }, on_conflict="agent_id").execute()
 
-    return {"status": "connected"}
+    frontend_url = os.environ.get("FRONTEND_URL")
+    return RedirectResponse(f"{frontend_url}/dashboard?gmail=connected")
 
 @app.post("/send-email")
 def send_email(request: SendEmailRequest):
