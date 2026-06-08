@@ -172,7 +172,7 @@ def google_auth_start(agent_id: str):
         },
         scopes=GMAIL_SCOPES,
     )
-    flow.redirect_uri = "http://localhost:8000/auth/google/callback"
+    flow.redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI")
 
     flow.code_verifier = "kindrasastaticverifierstringthatislongenough1234567890"
 
@@ -198,7 +198,7 @@ def google_auth_callback(code: str, state: str):
         },
         scopes=GMAIL_SCOPES,
     )
-    flow.redirect_uri = "http://localhost:8000/auth/google/callback"
+    flow.redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI")
 
     flow.code_verifier = "kindrasastaticverifierstringthatislongenough1234567890"
 
@@ -227,7 +227,7 @@ def google_auth_callback(code: str, state: str):
 def send_email(request: SendEmailRequest):
 
     connection = supabase.table("email_connections").select("refresh_token, email_address").eq("agent_id", request.agent_id).single().execute()
-    
+
     stored_refresh_token = connection.data["refresh_token"]
     sender_email_address = connection.data["email_address"]
 
