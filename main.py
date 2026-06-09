@@ -272,8 +272,7 @@ def send_email(request: SendEmailRequest):
     try:
         service = build("gmail", "v1", credentials=creds)
         service.users().messages().send(userId="me", body={"raw": raw}).execute()
-        frontend_url = os.environ.get("FRONTEND_URL")
-        return RedirectResponse(f"{frontend_url}/dashboard?gmail=connected")
+        return {"status": "success", "to": request.to_email}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
     
