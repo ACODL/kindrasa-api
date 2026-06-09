@@ -56,6 +56,9 @@ class SendEmailRequest(BaseModel):
     subject: str
     body: str
 
+class CheckEmailRequest(BaseModel):
+    agent_id: str
+
 @app.post("/draft")
 def create_draft(request: DraftRequest):
 
@@ -254,3 +257,12 @@ def send_email(request: SendEmailRequest):
         return RedirectResponse(f"{frontend_url}/dashboard?gmail=connected")
     except Exception as e:
         return {"status": "error", "detail": str(e)}
+    
+@app.get("/check-email-connection")
+def check(agent_id: str):
+    result = supabase.table("email_connections").select("email_address").eq("agent_id", agent_id).execute()
+
+    if result.data:
+        return {"connected": True, "email_address": result.data[0]["email_address"]}
+    else:
+        return {"connected": False}
