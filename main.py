@@ -74,7 +74,7 @@ def create_draft(request: DraftRequest):
     first_name = lead.data["first_name"]
     stage = lead.data["pipeline_stage"]
 
-    prompt = f"""You are helping a real estate agent write a follow-up message to a lead.
+    prompt = f"""You are helping a real estate agent write a follow-up EMAIL to a lead.
 
     Lead name: {first_name}
     Current pipeline stage: {stage}
@@ -82,7 +82,10 @@ def create_draft(request: DraftRequest):
     Recent activity:
     {activity_summary}
 
-    Write a brief, friendly, professional SMS follow-up message to {first_name}. Keep it under 160 characters. Do not include a subject line. Reference their interest naturally."""
+    Write a brief, warm, professional follow-up email. Return ONLY a JSON object with these exact fields:
+    - subject (string: a short, natural email subject line)
+    - body (string: the email message, friendly and concise, no subject line inside it)
+    Return only the JSON, no other text."""
 
     message = client.messages.create(
     model="claude-sonnet-4-5",
@@ -91,11 +94,27 @@ def create_draft(request: DraftRequest):
         {"role": "user", "content": prompt}
     ]
     )
+
+    raw_text = message.content[0].text.strip()
+
+    # strip markdown fences if present
+    if raw_text.startswith("```"):
+        raw_text = raw_text.split("```")[1]
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:]
+        raw_text = raw_text.strip()
+
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return {"error": "Could not parse draft", "raw": raw_text}
+    
     draft = supabase.table("ai_drafts").insert({
     "lead_id": request.lead_id,
     "agent_id": lead.data["agent_id"],
-    "message_content": message.content[0].text,
-    "channel": "SMS"
+    "message_content": parsed["body"],
+    "subject": parsed["subject"],
+    "channel": "email"
     }).execute()
 
 
