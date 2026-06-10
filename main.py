@@ -284,3 +284,43 @@ def check(agent_id: str):
         return {"connected": True, "email_address": result.data[0]["email_address"]}
     else:
         return {"connected": False}
+
+class FormLeadRequest(BaseModel):
+    first_name: str
+    last_name: str = ""
+    email: str = ""
+    phone_number: str = ""
+    message: str = ""
+
+@app.post("/webhook/form/{webhook_token}")
+def form_webhook(webhook_token: str, request: FormLeadRequest):
+    # look up which agent owns this token
+    agent = supabase.table("agents").select("userid").eq("webhook_token", webhook_token).execute()
+
+    if not agent.data:
+        return {"status": "error", "detail": "Invalid token"}
+
+    agent_id = agent.data[0]["userid"]
+
+    # create the lead
+    new_lead = supabase.table("leads").insert({
+        "agent_id": agent_id,
+        "first_name": request.first_name,
+        "last_name": request.last_name,
+        "email": request.email,
+        "phone_number": request.phone_number,
+        "pipeline_stage": "new"
+    }).execute()
+
+    new_lead_id = new_lead.data[0]["lead_id"]
+
+    # log the message as a first activity, if there is one
+    if request.message:
+        supabase.table("lead_activities").insert({
+            "lead_id": new_lead_id,
+            "performing_agent": agent_id,
+            "type": "note",
+            "content": request.message
+        }).execute()
+
+    return {"status": "success"}
