@@ -4,7 +4,9 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from anthropic import Anthropic
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import UploadFile, File
 
+import vobject
 import os
 
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
@@ -324,3 +326,90 @@ def form_webhook(webhook_token: str, request: FormLeadRequest):
         }).execute()
 
     return {"status": "success"}
+
+@app.post("/parse-vcard")
+async def parse_vcard(agent_id: str, file: UploadFile = File(...)):
+    contents = await file.read()
+    text = contents.decode("utf-8")
+
+    contacts = []
+    for vcard in vobject.readComponents(text):
+        if not hasattr(vcard, "fn"):
+            continue  # skip contacts with no name
+        contact = {"agent_id": agent_id, "status": "pending", "name": vcard.fn.value}
+        if hasattr(vcard, "fn"):
+            contact["name"] = vcard.fn.value
+        if hasattr(vcard, "email"):
+            contact["email"] = vcard.email.value
+        if hasattr(vcard, "tel"):
+            contact["phone"] = vcard.tel.value
+        if hasattr(vcard, "org"):
+            contact["company"] = vcard.org.value
+        if hasattr(vcard, "note"):
+            contact["note"] = vcard.note.value
+        if hasattr(vcard, "bday"):
+            contact["birthday"] = vcard.bday.value
+        contacts.append(contact)
+
+    if contacts:
+        supabase.table("pending_contacts").insert(contacts).execute()
+
+    return {"count": len(contacts), "contacts": contacts}
+
+class VCardContact(BaseModel):
+    name: str
+    email: str = ""
+    phone: str = ""
+    birthday: str = ""
+
+class ImportContactsRequest(BaseModel):
+    agent_id: str
+    contacts: list[VCardContact]
+
+class AcceptContactRequest(BaseModel):
+    pending_id: str
+
+@app.post("/accept-contact")
+def accept_contact(request: AcceptContactRequest):
+    # get the pending contact
+    pending = supabase.table("pending_contacts").select("*").eq("pending_id", request.pending_id).single().execute()
+    contact = pending.data
+
+    # split the name
+    parts = contact["name"].split(" ", 1)
+    first_name = parts[0]
+    last_name = parts[1] if len(parts) > 1 else ""
+
+    # validate birthday — only use it if it's a clean full date
+    birthday = None
+    if contact.get("birthday"):
+        raw = contact["birthday"]
+        # accept only YYYY-MM-DD format; skip no-year or malformed
+        if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+            birthday = raw
+
+    # create the lead
+    new_lead = supabase.table("leads").insert({
+        "agent_id": contact["agent_id"],
+        "first_name": first_name,
+        "last_name": last_name,
+        "email": contact.get("email", ""),
+        "phone_number": contact.get("phone", ""),
+        "birthday": birthday,
+        "pipeline_stage": "new"
+    }).execute()
+
+    new_lead_id = new_lead.data[0]["lead_id"]
+
+    # log the import as a first activity
+    supabase.table("lead_activities").insert({
+        "lead_id": new_lead_id,
+        "performing_agent": contact["agent_id"],
+        "type": "note",
+        "content": "Imported from phone contacts"
+    }).execute()
+
+    # mark the pending contact as imported
+    supabase.table("pending_contacts").update({"status": "imported"}).eq("pending_id", request.pending_id).execute()
+
+    return {"status": "imported"}
