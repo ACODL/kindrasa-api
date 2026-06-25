@@ -4,10 +4,16 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from anthropic import Anthropic
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import UploadFile, File
+from fastapi import UploadFile, File, Form
 
 import vobject
 import os
+import csv
+import io
+import anthropic
+import json
+import re
+
 
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 
@@ -394,7 +400,7 @@ def accept_contact(request: AcceptContactRequest):
         "first_name": first_name,
         "last_name": last_name,
         "email": contact.get("email", ""),
-        "phone_number": contact.get("phone", ""),
+        "phone_number": clean_phone(contact.get("phone", "")),
         "birthday": birthday,
         "pipeline_stage": "new"
     }).execute()
@@ -413,3 +419,148 @@ def accept_contact(request: AcceptContactRequest):
     supabase.table("pending_contacts").update({"status": "imported"}).eq("pending_id", request.pending_id).execute()
 
     return {"status": "imported"}
+
+@app.post("/parse-csv")
+async def parse_csv(file: UploadFile = File(...)):
+    contents = await file.read()
+    text = contents.decode("utf-8", errors="ignore")
+
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+
+    if not rows:
+        return {"headers": [], "sample_rows": [], "total_rows": 0}
+
+    headers = rows[0]
+    data_rows = rows[1:]
+
+    # grab a few non-empty sample rows for context
+    sample_rows = []
+    for row in data_rows:
+        if any(cell.strip() for cell in row):  # skip fully blank rows
+            sample_rows.append(row)
+        if len(sample_rows) >= 3:
+            break
+
+    return {
+        "headers": headers,
+        "sample_rows": sample_rows,
+        "total_rows": len(data_rows),
+    }
+
+@app.post("/map-columns")
+async def map_columns(payload: dict):
+    headers = payload["headers"]
+    sample_rows = payload["sample_rows"]
+
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+    prompt = f"""You are helping map spreadsheet columns to a CRM's fields.
+
+The CRM needs these fields: first_name, last_name, email, phone, birthday
+
+Here are the spreadsheet's column headers:
+{json.dumps(headers)}
+
+Here are a few sample rows (as arrays matching the headers order):
+{json.dumps(sample_rows)}
+
+Some headers may be blank or unclear — use the sample values to infer what each column contains.
+Note that names may be in "Last, First" format, "First Last" format, or a single name. 
+
+Return ONLY a JSON object (no markdown, no explanation) with this structure:
+{{
+  "mapping": {{ "first_name": <header or null>, "last_name": <header or null>, "email": <header or null>, "phone": <header or null>, "birthday": <header or null> }},
+  "name_format": "last_first" | "first_last" | "single" | "unknown"
+}}
+
+For each CRM field, give the exact header string from the spreadsheet that best matches, or null if no column matches. If one column contains the full name, map it to first_name and indicate the name_format."""
+
+    message = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    raw = message.content[0].text.strip()
+    # strip code fences if present
+    if raw.startswith("```"):
+        raw = raw.split("```")[1].replace("json", "", 1).strip()
+
+    mapping = json.loads(raw)
+    return mapping
+
+def split_name(full_name: str, name_format: str):
+    full_name = full_name.strip()
+    if name_format == "last_first" and "," in full_name:
+        parts = full_name.split(",", 1)
+        return parts[1].strip(), parts[0].strip()   # first, last
+    elif name_format == "first_last":
+        parts = full_name.split(" ", 1)
+        return parts[0], parts[1] if len(parts) > 1 else ""
+    else:  # single or unknown
+        return full_name, ""
+    
+def clean_phone(value: str):
+    if not value:
+        return ""
+    digits = re.sub(r'\D', '', value)   # strip everything but digits
+    # a real phone has 10-11 digits (US); reject things with too few
+    if len(digits) < 10:
+        return ""
+    return value.strip()
+
+@app.post("/process-csv")
+async def process_csv(
+    agent_id: str,
+    mapping: str = Form(...),
+    name_format: str = Form(...),
+    file: UploadFile = File(...),
+):
+    # mapping comes in as a JSON string in a form field — parse it
+    mapping_dict = json.loads(mapping)
+
+    contents = await file.read()
+    text = contents.decode("utf-8", errors="ignore")
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+
+    if not rows:
+        return {"count": 0}
+
+    headers = rows[0]
+    data_rows = rows[1:]
+
+    # helper: given a row and a Kindrasa field, return that cell's value
+    def cell_for(row, field):
+        col = mapping_dict.get(field)
+        if not col or col not in headers:
+            return ""
+        idx = headers.index(col)
+        return row[idx].strip() if idx < len(row) else ""
+
+    contacts = []
+    for row in data_rows:
+        if not any(c.strip() for c in row):   # skip blank rows
+            continue
+
+        raw_name = cell_for(row, "first_name")
+        if not raw_name:                       # skip rows with no name
+            continue
+
+        first, last = split_name(raw_name, name_format)
+
+        contact = {
+            "agent_id": agent_id,
+            "status": "pending",
+            "name": f"{first} {last}".strip(),  # pending_contacts stores a single name
+            "email": cell_for(row, "email"),
+            "phone": clean_phone(cell_for(row, "phone")),
+            "birthday": cell_for(row, "birthday") or None,
+        }
+        contacts.append(contact)
+
+    if contacts:
+        supabase.table("pending_contacts").insert(contacts).execute()
+
+    return {"count": len(contacts)}
